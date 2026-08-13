@@ -239,6 +239,13 @@ COAST_BANDS_KM = [(0, 15, "Xeebta", "Inshore"),
 # cells; a vessel genuinely working a cell logs hours, not minutes.
 FISHING_HOURS_THRESHOLD = 0.5
 
+# Months when the AIS fleet leaves Somali waters for the SW monsoon, measured
+# from unsubsampled 2019 data: July saw 62 vessel-days across the whole EEZ
+# against January's 5,316. Absence in these months says nothing about fish,
+# so they are excluded from training. Used as a fallback when the data has
+# been class-balanced and dormancy can no longer be detected from prevalence.
+FLEET_DORMANT_MONTHS = [7, 8]
+
 # ---------------------------------------------------------------- safety
 # Wave models mask shallow water: ~77% of cells within 15 km of the Somali
 # coast have no wave height, which is precisely where artisanal boats work.

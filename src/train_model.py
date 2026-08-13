@@ -62,17 +62,186 @@ META_PATH = config.MODELS_DIR / "hotspot_xgb.meta.json"
 # Kismayo lat band, the spatial holdout from docs/ARCHITECTURE.md.
 SPATIAL_HOLDOUT_LAT = (-2.0, 1.5)
 
+# Features available in BOTH regions. The wide training region has no GEBCO
+# coverage (bathymetry is a manual per-box download), so depth, seabed
+# roughness and distance-to-coast cannot be used in a transfer experiment.
+# lat/lon are excluded too: the whole question is whether ocean conditions
+# generalise to unseen water, and leaving coordinates in would let the model
+# answer with geography instead.
+TRANSFER_FEATURES = [
+    "sst", "sst_gradient",
+    "chl", "chl_lag7", "chl_lag14", "chl_age_days",
+    "current_speed",
+    "month_sin", "month_cos",
+]
+
 
 # ---------------------------------------------------------------- data load
 
-def available_years() -> list[int]:
-    files = glob.glob(str(config.PROCESSED_DIR / "features_historical_*.parquet"))
+def available_years(region: str = "somali") -> list[int]:
+    prefix = ("features_historical_" if region == "somali"
+              else f"features_{region}_historical_")
+    files = glob.glob(str(config.PROCESSED_DIR / f"{prefix}*.parquet"))
     years = []
     for f in files:
         stem = f.rsplit("_", 1)[-1].split(".")[0]
         if stem.isdigit():
             years.append(int(stem))
     return sorted(years)
+
+
+def region_file(region: str, year: int):
+    prefix = ("features_historical_" if region == "somali"
+              else f"features_{region}_historical_")
+    return config.PROCESSED_DIR / f"{prefix}{year}.parquet"
+
+
+def load_region(region: str, years: list[int], features: list[str],
+                extra: list[str]) -> pd.DataFrame:
+    """Load one region's processed years with only the columns needed."""
+    want = sorted(set(features + extra))
+    frames = []
+    for year in years:
+        path = region_file(region, year)
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_parquet(path, columns=want)
+        except Exception:
+            df = pd.read_parquet(path)
+            df = df[[c for c in want if c in df.columns]]
+        df["date"] = pd.to_datetime(df["date"])
+        df["year"] = df["date"].dt.year.astype("int16")
+        frames.append(df)
+        print(f"  {region} {year}: {len(df):,} rows, "
+              f"{int(df[LABEL].sum()):,} positive")
+    if not frames:
+        sys.exit(f"No processed files for region '{region}'. "
+                 f"Build them: python src/build_dataset.py --region {region}")
+    return pd.concat(frames, ignore_index=True)
+
+
+def run_transfer(args) -> None:
+    """Train on the wider Indian Ocean, test on Somali waters.
+
+    The question: does a model that has seen 7.8x more fishing across far more
+    varied water learn an environment -> fishing relationship that carries
+    into Somali waters it has never seen?
+
+    Somali-box rows are removed from the training set, so this is a genuine
+    spatial transfer test and not a memorisation check. A depth-free
+    Somali-trained control is fitted on the same features, so the comparison
+    is like for like.
+    """
+    features = list(TRANSFER_FEATURES)
+    extra = [LABEL, "cell_id", "date", "month", "lat", "lon"]
+
+    train_years = [y for y in available_years("wide") if y <= args.train_end]
+    test_years = [y for y in available_years("somali") if y > args.train_end]
+    print(f"Transfer experiment\n  train: wide region {train_years}"
+          f"\n  test:  somali region {test_years}")
+    if not train_years or not test_years:
+        sys.exit("Need wide training years and Somali test years.")
+
+    print("\nLoading wide training data...")
+    wide = load_region("wide", train_years, features, extra)
+    print("Loading Somali test data...")
+    test = load_region("somali", test_years, features, extra)
+
+    # Exclude the Somali box from training - otherwise this measures memory,
+    # not transfer.
+    box = config.REGIONS["somali"]
+    inside = (wide["lat"].between(*box["lat"]) & wide["lon"].between(*box["lon"]))
+    print(f"\nremoving {int(inside.sum()):,} Somali-box rows from wide training "
+          f"({inside.mean()*100:.1f}%)")
+    wide = wide[~inside]
+
+    # Do NOT infer dormancy here. The wide files were class-balanced at build
+    # time to fit in memory, which flattens every month to the same positive
+    # rate - prevalence-based detection then either sees uniformity or, worse,
+    # sees every month clearing the threshold and excludes nothing. Use the
+    # months measured from unsubsampled Somali data instead.
+    active = sorted(set(range(1, 13)) - set(config.FLEET_DORMANT_MONTHS))
+    print(f"excluding fleet-dormant months {config.FLEET_DORMANT_MONTHS} "
+          f"(measured on unsubsampled data, not inferred from these files)")
+    wide = wide[wide["month"].isin(active)]
+    test = test[test["month"].isin(active)]
+
+    # XGBoost needs the whole matrix in memory at once; 10.5M x 9 float32 does
+    # not fit here. Thin the training set, keeping every positive.
+    if args.max_train_rows and len(wide) > args.max_train_rows:
+        rng = np.random.default_rng(42)
+        pos = wide[wide[LABEL] == 1]
+        neg = wide[wide[LABEL] == 0]
+        room = max(args.max_train_rows - len(pos), len(pos))
+        if room < len(neg):
+            neg = neg.iloc[np.sort(rng.choice(len(neg), size=room, replace=False))]
+        wide = pd.concat([pos, neg], ignore_index=True)
+        print(f"  capped training set at {len(wide):,} rows "
+              f"(all {len(pos):,} positives kept)")
+
+    print(f"\ntrain {len(wide):,} rows ({wide[LABEL].mean()*100:.2f}% positive)")
+    print(f"test  {len(test):,} rows ({test[LABEL].mean()*100:.2f}% positive)")
+
+    print("\nFitting wide-region model...")
+    booster, calib = fit(wide, features)
+    pred_wide = predict(booster, calib, test, features)
+
+    # Control: same features, same split, but trained on Somali data only.
+    print("\nFitting Somali-only control (same features)...")
+    som_train_years = [y for y in available_years("somali") if y <= args.train_end]
+    som = load_region("somali", som_train_years, features, extra)
+    som = som[som["month"].isin(active)]     # same month filter as the wide side
+    if args.neg_per_pos:
+        rng = np.random.default_rng(42)
+        pos, neg = som[som[LABEL] == 1], som[som[LABEL] == 0]
+        take = min(len(neg), len(pos) * args.neg_per_pos)
+        neg = neg.iloc[np.sort(rng.choice(len(neg), size=take, replace=False))]
+        som = pd.concat([pos, neg], ignore_index=True)
+    ctrl, ctrl_cal = fit(som, features)
+    pred_ctrl = predict(ctrl, ctrl_cal, test, features)
+
+    print("\nScoring baselines...")
+    scored = [
+        ("wide_transfer", pred_wide),
+        ("somali_control", pred_ctrl),
+        ("climatology", baselines.climatology(som, test)),
+        ("physics_index", baselines.physics_index_baseline(som, test)),
+    ]
+    within = [baselines.evaluate_within_month(test, p, name=n) for n, p in scored]
+    pooled = [baselines.evaluate(test[LABEL], p, n) for n, p in scored]
+
+    print("\nPooled:")
+    print(pd.DataFrame(pooled).to_string(index=False))
+    print("\nWithin-month (the honest test):")
+    print(pd.DataFrame([{k: v for k, v in w.items() if k != "per_month"}
+                        for w in within]).to_string(index=False))
+
+    wide_score = within[0]["pr_auc_within_month"]
+    clim_score = next(w["pr_auc_within_month"] for w in within
+                      if w["model"] == "climatology")
+    ctrl_score = within[1]["pr_auc_within_month"]
+    print(f"\nWide transfer beats climatology: {wide_score > clim_score}")
+    print(f"Wide transfer beats Somali-only control: {wide_score > ctrl_score}")
+    print("\nFeature importance (wide model):")
+    for row in feature_importance(booster, features)[:8]:
+        print(f"  {row['feature']:18s} {row['gain_share']*100:5.1f}%")
+
+    out = config.MODELS_DIR / "transfer_experiment.json"
+    out.write_text(json.dumps({
+        "trained_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "features": features,
+        "train_region": "wide (Somali box excluded)",
+        "train_years": train_years,
+        "test_region": "somali",
+        "test_years": test_years,
+        "pooled": pooled,
+        "within_month": [{k: v for k, v in w.items() if k != "per_month"}
+                         for w in within],
+        "beats_climatology": bool(wide_score > clim_score),
+        "beats_somali_control": bool(wide_score > ctrl_score),
+    }, indent=2), encoding="utf-8")
+    print(f"\nWrote {out}")
 
 
 def load(features: list[str], neg_per_pos: int | None, train_end: int,
@@ -211,7 +380,18 @@ def main() -> None:
                              "test on it, to measure spatial transfer")
     parser.add_argument("--dry-run", action="store_true",
                         help="report data readiness and exit")
+    parser.add_argument("--max-train-rows", type=int, default=2_500_000,
+                        help="cap on training rows (positives always kept). "
+                             "XGBoost holds the whole matrix in memory.")
+    parser.add_argument("--transfer", action="store_true",
+                        help="train on the wider Indian Ocean (Somali box "
+                             "removed) and test on Somali waters, against a "
+                             "Somali-trained control on the same features")
     args = parser.parse_args()
+
+    if args.transfer:
+        run_transfer(args)
+        return
 
     features = list(FEATURES)
     if args.with_weather:

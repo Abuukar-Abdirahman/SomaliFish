@@ -94,13 +94,27 @@ def _open_many(pattern: str) -> xr.Dataset | None:
     return ds
 
 
-def _to_grid(ds: xr.Dataset, lats: np.ndarray, lons: np.ndarray) -> xr.Dataset:
+def _to_grid(ds: xr.Dataset, lats: np.ndarray, lons: np.ndarray,
+             time_chunk: int = 40) -> xr.Dataset:
     """Interpolate a dataset onto the common grid.
 
     Linear interpolation. Every source is coarser than or close to 0.1 degrees,
     so this is downsampling or mild resampling, not invention of detail.
+
+    Done in time slices: a full year of 4 km chlorophyll over the wide region
+    is a single 250 x 160,600 float64 allocation, which does not fit. Chunking
+    costs nothing and makes the wide grid possible.
     """
-    return ds.interp(latitude=lats, longitude=lons, method="linear")
+    if "time" not in ds.dims or ds.sizes["time"] <= time_chunk:
+        return ds.interp(latitude=lats, longitude=lons, method="linear")
+
+    pieces = []
+    n = ds.sizes["time"]
+    for start in range(0, n, time_chunk):
+        piece = ds.isel(time=slice(start, start + time_chunk))
+        pieces.append(piece.interp(latitude=lats, longitude=lons,
+                                   method="linear").load())
+    return xr.concat(pieces, dim="time")
 
 
 def _daily(ds: xr.Dataset) -> xr.Dataset:
@@ -249,9 +263,10 @@ def add_cyclic_month(df: pd.DataFrame) -> pd.DataFrame:
 
 def load_sources(mode: str, year: int | None) -> dict[str, xr.Dataset]:
     """Open every downloaded source for a mode, optionally filtered to a year."""
-    raw = config.RAW_DIR / mode
+    raw = config.region_dir(config.RAW_DIR) / mode
     if not raw.exists():
-        sys.exit(f"No data at {raw}. Run: python src/download_data.py --mode {mode}")
+        sys.exit(f"No data at {raw}. Run: python src/download_data.py --mode {mode}"
+                 + (f" --region {config.REGION}" if config.REGION != "somali" else ""))
 
     suffix = f"*{year}*" if year else "*"
     sources: dict[str, xr.Dataset] = {}
@@ -269,6 +284,10 @@ def load_sources(mode: str, year: int | None) -> dict[str, xr.Dataset]:
     # trains a model on inconsistent inputs.
     expected = set(config.DATASETS_HISTORICAL if mode == "historical"
                    else config.DATASETS_NRT)
+    if config.REGION != "somali":
+        # Non-serving regions are training-only, so waves and wind are never
+        # downloaded for them - they are excluded from the model by design.
+        expected &= set(config.TRAINING_DATASETS)
     absent = expected - set(sources)
     if absent:
         print(f"  [MISSING SOURCES] {sorted(absent)} for "
@@ -279,8 +298,15 @@ def load_sources(mode: str, year: int | None) -> dict[str, xr.Dataset]:
     return sources
 
 
-def build_year(mode: str, year: int | None, lats, lons) -> pd.DataFrame:
-    """Build the cell x day feature table for one year."""
+def build_year(mode: str, year: int | None, lats, lons,
+               labels: pd.DataFrame | None = None,
+               neg_per_pos: int | None = None) -> pd.DataFrame:
+    """Build the cell x day feature table for one year.
+
+    If `labels` is supplied the GFW join (and optional negative subsampling)
+    happens per time chunk, keeping peak memory proportional to the chunk
+    rather than the year.
+    """
     sources = load_sources(mode, year)
     print(f"  sources: {', '.join(sorted(sources))}")
 
@@ -341,19 +367,51 @@ def build_year(mode: str, year: int | None, lats, lons) -> pd.DataFrame:
         sys.exit("No overlapping days across sources - nothing to build.")
     merged = carry_chlorophyll_forward(merged)
 
-    df = merged.to_dataframe().reset_index()
+    # Convert to rows in time slices, discarding land as we go. Materialising
+    # a whole year at once is 6.3M rows for the Somali grid and 20M for the
+    # wide one; the latter does not fit in memory. Land is roughly half the
+    # grid, so dropping it inside the loop keeps the peak far lower than the
+    # final table.
+    n_time = merged.sizes["time"]
+    step = max(1, min(n_time, 15))
+    parts, dropped_total = [], 0
+    rng = np.random.default_rng(42)
+    for start in range(0, n_time, step):
+        chunk = merged.isel(time=slice(start, start + step)).load()
+        piece = chunk.to_dataframe().reset_index()
+        chunk.close()
+        piece = piece.rename(columns={"latitude": "lat", "longitude": "lon",
+                                      "time": "date"})
+        before = len(piece)
+        piece = piece[piece["sst"].notna()]
+        dropped_total += before - len(piece)
+        if not len(piece):
+            continue
+        piece = _finalise_rows(piece)
+        # Label and thin inside the loop, not after. Accumulating every ocean
+        # row first is what exhausts memory on the wide grid.
+        if labels is not None:
+            piece = join_labels(piece, labels)
+            if neg_per_pos:
+                piece = subsample_negatives(piece, neg_per_pos, rng)
+        parts.append(piece)
     for ds in sources.values():
         ds.close()
 
-    # ---- tidy up
-    df = df.rename(columns={"latitude": "lat", "longitude": "lon", "time": "date"})
+    if not parts:
+        sys.exit("Every row was land or missing SST - nothing to build.")
+    df = pd.concat(parts, ignore_index=True)
+    del parts
+    print(f"  dropped {dropped_total:,} land/no-data rows, kept {len(df):,}")
+
+    lead = ["cell_id", "date", "lat", "lon", "lat_idx", "lon_idx"]
+    return df[lead + [c for c in df.columns if c not in lead]]
+
+
+def _finalise_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-chunk tidy-up: dates, month encoding, units, indices, dtypes."""
+    df = df.copy()
     df["date"] = pd.to_datetime(df["date"]).dt.normalize()
-
-    # Land and no-data cells: SST is absent over land, so it is our ocean mask.
-    before = len(df)
-    df = df[df["sst"].notna()].copy()
-    print(f"  dropped {before - len(df):,} land/no-data rows, kept {len(df):,}")
-
     df["month"] = df["date"].dt.month.astype("int8")
     df = add_cyclic_month(df)
 
@@ -372,12 +430,69 @@ def build_year(mode: str, year: int | None, lats, lons) -> pd.DataFrame:
     for col in df.columns:
         if df[col].dtype == "float64":
             df[col] = df[col].astype("float32")
-
-    lead = ["cell_id", "date", "lat", "lon", "lat_idx", "lon_idx"]
-    return df[lead + [c for c in df.columns if c not in lead]]
+    return df
 
 
 # ------------------------------------------------------------------ labels
+
+def load_gfw_cells(year: int | None) -> pd.DataFrame | None:
+    """Load GFW effort for a year, aggregated to grid cell-days.
+
+    Returned separately from the join so the caller can apply it chunk by
+    chunk, which is what makes the 20-million-row wide region buildable.
+    """
+    import download_gfw
+
+    gfw_dir = config.region_dir(config.RAW_DIR) / "gfw"
+    pattern = f"gfw_{year}-*.parquet" if year else "gfw_*.parquet"
+    files = sorted(gfw_dir.glob(pattern)) if gfw_dir.exists() else []
+    if not files:
+        print(f"  [warn] no GFW files matching {pattern} in {gfw_dir} - "
+              f"no labels.\n         Run: python src/download_gfw.py"
+              + (f" --region {config.REGION}" if config.REGION != "somali" else ""))
+        return None
+
+    raw = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    cells = download_gfw.to_grid_cells(raw)
+    cells["date"] = pd.to_datetime(cells["date"]).dt.normalize()
+    lat_idx, lon_idx = cell_index(cells["lat"], cells["lon"])
+    cells["lat_idx"] = lat_idx
+    cells["lon_idx"] = lon_idx
+
+    lats, lons = build_grid()
+    inside = ((cells.lat_idx >= 0) & (cells.lat_idx < len(lats))
+              & (cells.lon_idx >= 0) & (cells.lon_idx < len(lons)))
+    outside = int((~inside).sum())
+    cells = cells[inside]
+    cells = (cells.groupby(["date", "lat_idx", "lon_idx"], as_index=False)
+                  .agg(fishing_hours=("fishing_hours", "sum"),
+                       n_vessels=("n_vessels", "sum")))
+    print(f"  GFW: {len(cells):,} cell-days from {len(files)} month(s)"
+          + (f", {outside:,} outside the grid" if outside else ""))
+    return cells
+
+
+def join_labels(df: pd.DataFrame, cells: pd.DataFrame) -> pd.DataFrame:
+    """Attach fishing labels to one chunk of rows. Joins on integer indices."""
+    out = df.merge(cells, on=["date", "lat_idx", "lon_idx"], how="left")
+    out["fishing_hours"] = out["fishing_hours"].fillna(0.0).astype("float32")
+    out["n_vessels"] = out["n_vessels"].fillna(0).astype("int16")
+    out["fished"] = (out["fishing_hours"]
+                     > config.FISHING_HOURS_THRESHOLD).astype("int8")
+    return out
+
+
+def subsample_negatives(df: pd.DataFrame, neg_per_pos: int,
+                        rng: np.random.Generator) -> pd.DataFrame:
+    """Keep every positive, at most neg_per_pos negatives for each."""
+    pos = df[df["fished"] == 1]
+    neg = df[df["fished"] == 0]
+    take = min(len(neg), max(len(pos), 1) * neg_per_pos)
+    if take < len(neg):
+        pick = np.sort(rng.choice(len(neg), size=take, replace=False))
+        neg = neg.iloc[pick]
+    return pd.concat([pos, neg], ignore_index=True)
+
 
 def add_fishing_labels(df: pd.DataFrame, year: int | None) -> pd.DataFrame:
     """Attach Global Fishing Watch apparent fishing effort as training labels.
@@ -396,7 +511,7 @@ def add_fishing_labels(df: pd.DataFrame, year: int | None) -> pd.DataFrame:
     """
     import download_gfw
 
-    gfw_dir = config.RAW_DIR / "gfw"
+    gfw_dir = config.region_dir(config.RAW_DIR) / "gfw"
     pattern = f"gfw_{year}-*.parquet" if year else "gfw_*.parquet"
     files = sorted(gfw_dir.glob(pattern)) if gfw_dir.exists() else []
     if not files:
@@ -455,7 +570,8 @@ def add_bathymetry(df: pd.DataFrame, lats, lons) -> pd.DataFrame:
     and is also one of the two required baselines, so this is not optional for
     the final model -- but the table is still useful without it.
     """
-    gebco = next(iter(glob.glob(str(config.RAW_DIR / "gebco" / "*.nc"))), None)
+    gebco = next(iter(glob.glob(str(config.region_dir(config.RAW_DIR)
+                                    / "gebco" / "*.nc"))), None)
     if gebco is None:
         print("  [warn] no GEBCO file in data/raw/gebco/ - skipping depth and "
               "dist_coast.\n         Download the bounding-box cutout: "
@@ -567,7 +683,18 @@ def main() -> None:
                         help="skip the GEBCO depth join")
     parser.add_argument("--no-labels", action="store_true",
                         help="skip the GFW fishing-effort label join")
+    parser.add_argument("--region", choices=list(config.REGIONS), default="somali",
+                        help="'wide' builds the western Indian Ocean training "
+                             "region (55,000 cells) into its own files")
+    parser.add_argument("--neg-per-pos", type=int, default=None,
+                        help="keep at most N negative rows per positive, "
+                             "dropping the rest. All positives are always "
+                             "kept. Needed for the wide region, where a full "
+                             "year is ~14M rows. Training data only - never "
+                             "use on anything you will evaluate on.")
     args = parser.parse_args()
+
+    config.set_region(args.region)
 
     if args.list:
         list_downloaded()
@@ -590,16 +717,28 @@ def main() -> None:
     for year in years:
         label = str(year) if year else "latest"
         print(f"\n[{args.mode} {label}]")
+        want_labels = args.mode == "historical" and not args.no_labels
+        labels = load_gfw_cells(year) if want_labels else None
         try:
-            df = build_year(args.mode, year, lats, lons)
+            df = build_year(args.mode, year, lats, lons, labels,
+                            args.neg_per_pos)
         except SystemExit as exc:
             print(f"  skipped: {exc}")
             continue
         if not args.no_bathymetry:
             df = add_bathymetry(df, lats, lons)
-        if args.mode == "historical" and not args.no_labels:
-            df = add_fishing_labels(df, year)
-        out = config.PROCESSED_DIR / f"features_{args.mode}_{label}.parquet"
+
+        if "fished" in df:
+            rate = df["fished"].mean() * 100
+            print(f"  labels: {int(df['fished'].sum()):,} fished cell-days "
+                  f"({rate:.2f}% positive"
+                  + (f", negatives thinned {args.neg_per_pos}:1"
+                     if args.neg_per_pos else "") + ")")
+
+        prefix = f"features_{args.mode}"
+        if args.region != "somali":
+            prefix = f"features_{args.region}_{args.mode}"
+        out = config.PROCESSED_DIR / f"{prefix}_{label}.parquet"
         df.to_parquet(out, index=False)
         written.append(out)
         print(f"  wrote {out.name}  ({len(df):,} rows x {len(df.columns)} cols, "

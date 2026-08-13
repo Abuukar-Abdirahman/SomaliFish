@@ -91,10 +91,25 @@ def fleet_active_months(df: pd.DataFrame, min_positive_rate: float = 0.002
     the fleet was present, and state plainly that the hotspot model does not
     apply in the off-season. The safety module and the physics index still do.
     """
-    rate = df.groupby("month", observed=True)[
-        "fished"].mean() if "fished" in df else None
-    if rate is None:
+    if "fished" not in df:
         return pd.Series(True, index=df.index), []
+    rate = df.groupby("month", observed=True)["fished"].mean()
+
+    # Detection relies on months differing in prevalence. If negatives were
+    # subsampled to a fixed ratio per period (as the wide region is, to fit in
+    # memory), every month ends up at the same rate by construction and
+    # nothing looks dormant. Fall back to the months measured directly from
+    # unsubsampled Somali data rather than silently keeping everything.
+    spread = float(rate.max() - rate.min()) if len(rate) else 0.0
+    if spread < 0.2 * float(rate.mean() or 1):
+        active = sorted(set(range(1, 13)) - set(config.FLEET_DORMANT_MONTHS))
+        print(f"  [note] monthly positive rates are near-uniform "
+              f"(spread {spread:.4f}) - this data looks class-balanced, so "
+              f"dormancy cannot be detected from it.\n"
+              f"         Falling back to the measured dormant months "
+              f"{config.FLEET_DORMANT_MONTHS}.")
+        return df["month"].isin(active), active
+
     active = sorted(int(m) for m in rate[rate >= min_positive_rate].index)
     dormant = sorted(set(range(1, 13)) - set(active))
     if dormant:

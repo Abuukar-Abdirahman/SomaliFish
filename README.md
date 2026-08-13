@@ -143,12 +143,50 @@ is an absence of evidence that it is right. We ship it because it is
 transparent and physically motivated, and we label it a *measured indicator,
 not a prediction*, everywhere it appears.
 
+### The wider-region transfer experiment (run, and it failed)
+
+More data did not fix it. We downloaded the western Indian Ocean
+(lat −10 → 15, lon 38 → 60; 5.5 GB, 1,145,721 fished cell-days across 35,586
+cells — 7.8× the Somali box), trained on it with **Somali-box rows removed**,
+and tested on Somali waters 2024+.
+
+All four methods restricted to the same depth-free, coordinate-free feature
+set, so the comparison is like for like. 5.78M test rows, 10 fleet-active
+months:
+
+| Method | Within-month PR-AUC | Lift |
+|---|---|---|
+| climatology | **0.0137** | **4.59×** |
+| **physics index** | **0.0060** | **2.03×** |
+| Somali-trained control | 0.0051 | 1.63× |
+| wide-region transfer | 0.0041 | 1.31× |
+
+Two findings worth stating plainly:
+
+**1. Training on 7.8× more data made the model worse**, not better — the
+wide-region model (0.0041) underperforms the Somali-only control (0.0051) on
+identical features. Domain shift outweighs the extra volume.
+
+**2. On a level playing field, the transparent physics index beats both
+trained models.** Note this reverses the ranking in the table above, where the
+hotspot model had access to depth and coordinates and the index did not. That
+difference is the point: the model's apparent advantage came from memorising
+*place*, not from understanding the ocean. Deny it geography and a
+two-variable formula does better.
+
+Supporting evidence: with coordinates removed, chlorophyll finally dominates
+the wide model's feature importance (29.9%, up from 6.6%). It does key on the
+right physics — it simply does not beat using that physics directly.
+
+None of this makes the index *validated* — nothing we have measures
+biological productivity, only vessel behaviour. But it is now the best
+condition-based ranker we have tested, which is why it is what ships.
+
 Likeliest explanation for all of the above: **AIS fishing effort is a weak
 proxy for fish.** Industrial vessels choose grounds by licences, quotas, fuel
-cost and accumulated crew knowledge, not by yesterday's chlorophyll. Training
-on the wider western Indian Ocean (7.8× the fishing data — 1,145,721 fished
-cell-days across 35,586 cells) is the next experiment, though the spatial
-holdout result sets a low prior on it succeeding.
+cost and accumulated crew knowledge, not by yesterday's chlorophyll. The
+missing ingredient is Somali catch data, not a better algorithm — which is
+what Phase 2 of `docs/ROADMAP.md` exists to collect.
 
 ## What is real, today
 
