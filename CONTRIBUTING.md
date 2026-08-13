@@ -36,6 +36,10 @@ works — it just labels the data as cached.
 
 Only required if you want to regenerate data or retrain.
 
+> **See [`docs/DATA_SETUP.md`](docs/DATA_SETUP.md) for the complete download
+> guide**: every dataset, exact size, where each file goes, and which tier you
+> actually need. Short version below.
+
 ### 1. Copernicus Marine (ocean data)
 
 Register at <https://data.marine.copernicus.eu>, confirm the email, then:
